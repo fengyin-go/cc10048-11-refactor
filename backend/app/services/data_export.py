@@ -2,15 +2,23 @@
 # 数据操作：处理、处理、处理，与上下游模块联动消费批次数据。
 from __future__ import annotations
 
-import csv
-import io
 import json
 import random
 from datetime import datetime
 from typing import Any
 
+from app.attachments import (
+    Attachment,
+    build_csv_attachment,
+    build_json_attachment,
+    persist_attachment,
+    registry,
+)
+from app.config import settings
 from app.services.base import BaseModuleService
 from app.store import store
+
+EXPORT_DIR = settings.attachment_dir
 
 
 class DataExportService(BaseModuleService):
@@ -23,15 +31,12 @@ class DataExportService(BaseModuleService):
     ACTION_RULES = {"启动导出": "排队中", "取消导出": "导出中"}
     NEGATIVE_ACTIONS = []
 
-    def execute_export(self, task_id: int) -> dict[str, Any]:
-        """执行数据导出，生成模拟文件内容。"""
-        task = store.find(self.MODULE, task_id)
-        if not task:
-            return {"error": f"导出任务 {task_id} 不存在"}
-        fmt = str(task.get("导出格式", "csv"))
+    EXPORT_COLUMNS = ["id", "日期", "指标名称", "维度值", "指标数值", "环比变化", "同比变化"]
+
+    def _build_rows(self, task_id: int) -> tuple[list[dict[str, Any]], str]:
+        fmt = str(store.find(self.MODULE, task_id).get("导出格式", "csv"))
         rng = random.Random(task_id)
         n_rows = rng.randint(10, 500)
-        headers = ["id", "日期", "指标名称", "维度值", "指标数值", "环比变化", "同比变化"]
         data = []
         for i in range(n_rows):
             data.append({
@@ -43,29 +48,81 @@ class DataExportService(BaseModuleService):
                 "环比变化": f"{rng.uniform(-10, 10):.1f}%",
                 "同比变化": f"{rng.uniform(-20, 20):.1f}%",
             })
-        content = ""
+        return data, fmt
+
+    def build_attachment(
+        self,
+        task_id: int,
+        *,
+        fail_at_row: int | None = None,
+        persist: bool = True,
+        format_override: str | None = None,
+        directory: str | None = None,
+    ) -> Attachment | None:
+        """把导出明细渲染成附件数据；列、预览和字节口径仍归本模块所有。"""
+        task = store.find(self.MODULE, task_id)
+        if not task:
+            return None
+        data, configured = self._build_rows(task_id)
+        fmt = format_override or configured
+        name = f"data_export_{task_id}.{fmt if fmt in ('csv', 'json') else 'txt'}"
         if fmt == "json":
-            content = json.dumps(data, ensure_ascii=False, indent=2)
+            attachment = build_json_attachment(
+                name, data, fail_at_row=fail_at_row, source="data_export")
         elif fmt == "csv":
-            buf = io.StringIO()
-            writer = csv.DictWriter(buf, fieldnames=headers)
-            writer.writeheader()
-            writer.writerows(data)
-            content = buf.getvalue()
+            rows = [[item[column] for column in self.EXPORT_COLUMNS] for item in data]
+            attachment = build_csv_attachment(
+                name,
+                self.EXPORT_COLUMNS,
+                rows,
+                lineterminator="\r\n",
+                source="data_export",
+                fail_at_row=fail_at_row,
+            )
+        else:
+            text = ""
+            attachment = Attachment(
+                name=name, format=str(fmt or "unknown"), data=text.encode("utf-8"),
+                rows=0, complete=fail_at_row is None, failed_at_row=fail_at_row,
+                source="data_export",
+            )
+        if persist and attachment.data:
+            persist_attachment(attachment, directory or EXPORT_DIR)
+        return attachment
+
+    def execute_export(self, task_id: int, *, fail_at_row: int | None = None) -> dict[str, Any]:
+        """执行数据导出，生成模拟文件内容。"""
+        task = store.find(self.MODULE, task_id)
+        if not task:
+            return {"error": f"导出任务 {task_id} 不存在"}
+        data, fmt = self._build_rows(task_id)
+        attachment = self.build_attachment(task_id, fail_at_row=fail_at_row)
+        assert attachment is not None
+        registry.put(f"export:{task_id}", attachment)
+        content = attachment.text
+        # 未知格式不落内容，沿用原有口径：行数仍按生成的记录数计，字节为 0。
+        written_rows = attachment.rows if fmt in ("csv", "json") else len(data)
         update = store.find(self.MODULE, task_id)
-        if update:
+        if update and attachment.complete:
             update["文件大小"] = f"{len(content.encode('utf-8')) / 1024:.1f}KB"
             update["导出状态"] = "已完成"
             update["完成时间"] = datetime.now().isoformat()
             update["status"] = "已完成"
             update["pending"] = False
+        elif update:
+            update["文件大小"] = f"{len(content.encode('utf-8')) / 1024:.1f}KB"
+            update["导出状态"] = "导出中"
+            update["status"] = "导出中"
+            update["pending"] = True
         return {
             "task_id": task_id,
             "task_name": task.get("任务标识"),
             "format": fmt,
-            "rows_exported": n_rows,
+            "rows_exported": written_rows,
+            "total_rows": len(data),
             "file_size_kb": round(len(content.encode("utf-8")) / 1024, 2),
             "preview": data[:5],
+            "attachment": attachment.evidence(),
         }
 
     def domain_enrich(self, config_id: int) -> dict:

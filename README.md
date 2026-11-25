@@ -77,5 +77,21 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 附件与监控交付
+
+- `backend/app/attachments.py` 收拢资源清单与导出明细共用的 CSV/JSON 渲染，
+  差异只通过参数表达：清单保留原表头 + BOM + 换行 `\n` + 公式转义；
+  导出明细保留自己的列、`\r\n` 换行和字节数口径。两个入口的输出字节不变。
+- 每次渲染同时产出格式证据（编码、数据行数、总行数、字节数、是否写完），
+  落盘后按实际文件字节回填，避免清单与文件打架。
+- `GET /api/chains/monitor-delivery/{rule_id}` 会实际写出资源清单和明细两份不同格式的
+  附件，并在 `delivery` 里给出文件清单、`claimable` / `incomplete` 和 `config_check`；
+  可用 `detail_task_id`、`detail_format`、`fail_at_row` 复现中断，`delivery_key` 复用同一份交付。
+- `POST /api/chains/monitor-delivery/{rule_id}/claim?file=清单|明细`：先核对配置，
+  再判断该文件是否写完；没写完的文件不报可领取，同一领取人重复领取返回原记录。
+- `POST /api/chains/monitor-delivery/{rule_id}/deliver?files=all&recipient=...`：
+  只送达已写完的文件，同一接收人的同一文件只保留原送达记录。
+- `GET /api/chains/monitor-delivery/{rule_id}/manifest`：读取文件清单、领取和送达记录。
+
 领域：数据工程
 子方向：数据分析与数据应用

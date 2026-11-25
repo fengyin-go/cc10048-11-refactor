@@ -17,6 +17,8 @@ class Settings:
     )
     page_size_default: int = 20
     page_size_max: int = 200
+    # 附件落盘目录：监控交付从这里读取实际写出的文件，而不是重新估算。
+    attachment_dir: str = "/tmp/s11-delivery"
 
 
 settings = Settings()

@@ -111,13 +111,13 @@ def drill_down_execute(path_id: int) -> dict[str, Any]:
 
 
 @router.get("/data_export/{task_id}/execute")
-def data_export_execute(task_id: int) -> dict[str, Any]:
-    """数据导出执行。"""
+def data_export_execute(task_id: int, fail_at_row: int | None = None) -> dict[str, Any]:
+    """数据导出执行；``fail_at_row`` 用于复现写到中途中断的明细。"""
     from app.services.data_export import DataExportService
     svc = SERVICES.get("data_export")
     if not svc or not isinstance(svc, DataExportService):
         raise HTTPException(404, "数据导出服务不可用")
-    return svc.execute_export(task_id)
+    return svc.execute_export(task_id, fail_at_row=fail_at_row)
 
 
 @router.get("/data_freshness/{check_id}/check")

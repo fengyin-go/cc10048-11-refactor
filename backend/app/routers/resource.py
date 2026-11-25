@@ -1,13 +1,12 @@
 """统一资源接口：查询、导出、登记和动作按模块 key 分派到领域服务。"""
 from __future__ import annotations
 
-import csv
-import io
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
+from app.attachments import build_inventory_attachment, registry
 from app.schemas import ActionPayload, ActionResult, EntryPayload, PageResult
 from app.services import service_for
 
@@ -56,19 +55,12 @@ def export_entries(
     }
     items, _ = service.list_entries(
         filters=filters, keyword=keyword, status=status, page=1, size=1_000_000)
-    output = io.StringIO()
-    output.write("\ufeff")
-    writer = csv.writer(output, lineterminator="\n")
-    writer.writerow(["id", *service.LIST_FIELDS, "status"])
-    for item in items:
-        values = [item.get("id"), *(item.get(field, "") for field in service.LIST_FIELDS),
-                  item.get("status", "")]
-        writer.writerow([
-            "'" + str(value) if str(value or "").startswith(("=", "+", "-", "@")) else value
-            for value in values
-        ])
+    attachment = registry.put(
+        f"inventory:{module}",
+        build_inventory_attachment(module, service, items),
+    )
     return StreamingResponse(
-        iter([output.getvalue()]), media_type="text/csv; charset=utf-8",
+        iter([attachment.text]), media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="{module}.csv"'},
     )
 

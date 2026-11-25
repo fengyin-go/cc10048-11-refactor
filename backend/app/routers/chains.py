@@ -5,13 +5,14 @@ import random
 import time
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 
 from app.compute import (
     aggregate, anomaly_iqr, anomaly_zscore, cache_hit_simulation,
     chi_square_test, compute_calibrate_bias, compute_freshness_delay,
     generate_mock_metric_values, random_sample, segment_diff_report, t_test,
 )
+from app.services.monitor_delivery import monitor_delivery_service
 from app.store import store
 
 router = APIRouter(prefix="/api/chains", tags=["业务链路"])
@@ -223,8 +224,18 @@ def chain_cohort_analysis(cohort_id: int) -> dict[str, Any]:
 
 # ---- 链路4：异常检测→数据时效→数据导出 ----
 @router.get("/monitor-delivery/{rule_id}")
-def chain_monitor_delivery(rule_id: int) -> dict[str, Any]:
-    """异常检测→数据时效→导出的监控交付链路。"""
+def chain_monitor_delivery(
+    rule_id: int,
+    detail_task_id: int | None = None,
+    detail_format: str | None = None,
+    fail_at_row: int | None = None,
+    delivery_key: str | None = None,
+) -> dict[str, Any]:
+    """异常检测→数据时效→导出的监控交付链路。
+
+    交付资料由两个既有入口实际写出：资源清单沿用统一导出入口，
+    明细沿用导出任务自己的列与字节口径；文件清单读取磁盘真实字节。
+    """
     rule = store.find("anomaly_detect", rule_id)
     if not rule:
         raise HTTPException(404, f"检测规则 {rule_id} 不存在")
@@ -255,18 +266,30 @@ def chain_monitor_delivery(rule_id: int) -> dict[str, Any]:
             "result": result,
         })
 
-    # Step 3: 数据导出
-    export_tasks = [row for row in store.rows("data_export")][:3]
+    # Step 3: 交付资料（资源清单 + 明细导出）
+    try:
+        delivery = monitor_delivery_service.build_delivery(
+            rule_id,
+            detail_task_id=detail_task_id,
+            detail_format=detail_format,
+            fail_at_row=fail_at_row,
+            delivery_key=delivery_key,
+        )
+    except ValueError as error:
+        raise HTTPException(400, str(error))
     export_results = []
-    for et in export_tasks:
-        fmt = et.get("导出格式", "csv")
+    detail_task = store.find("data_export", int(delivery.get("detail_task_id") or 0))
+    for name, record in delivery.get("files", {}).items():
         export_results.append({
-            "task_id": et.get("id"),
-            "task_name": et.get("任务标识"),
-            "format": fmt,
-            "field_selection": et.get("字段筛选", "全部"),
-            "estimated_rows": rng.randint(100, 50000),
-            "estimated_size_mb": round(rng.uniform(0.1, 50.0), 2),
+            "task_id": delivery.get("detail_task_id"),
+            "task_name": detail_task.get("任务标识") if detail_task else None,
+            "format": record.get("format"),
+            "file": name,
+            "encoding": record.get("encoding"),
+            "rows": record.get("rows"),
+            "byte_count": record.get("byte_count"),
+            "complete": record.get("complete"),
+            "claimable": record.get("claimable"),
         })
 
     return {
@@ -276,7 +299,59 @@ def chain_monitor_delivery(rule_id: int) -> dict[str, Any]:
         "anomaly_detection": anomaly_result,
         "data_freshness": freshness_results,
         "data_export": export_results,
+        "delivery": {
+            "delivery_id": delivery.get("delivery_id"),
+            "detail_task_id": delivery.get("detail_task_id"),
+            "detail_format": delivery.get("detail_format"),
+            "complete": delivery.get("complete"),
+            "claimable": delivery.get("claimable"),
+            "incomplete": delivery.get("incomplete"),
+            "files": delivery.get("files"),
+            "config_check": delivery.get("config_check"),
+            "claims": delivery.get("claims"),
+            "送达记录": delivery.get("送达记录"),
+        },
     }
+
+
+@router.post("/monitor-delivery/{rule_id}/claim")
+def monitor_delivery_claim(
+    rule_id: int,
+    file: str | None = None,
+    requester: str = "资料组",
+    delivery_key: str | None = None,
+) -> dict[str, Any]:
+    """领取一份交付资料；先核对配置，未写完的文件不报可领取。"""
+    if not store.find("anomaly_detect", rule_id):
+        raise HTTPException(404, f"检测规则 {rule_id} 不存在")
+    return monitor_delivery_service.claim(
+        rule_id, file=file, requester=requester, delivery_key=delivery_key)
+
+
+@router.post("/monitor-delivery/{rule_id}/deliver")
+def monitor_delivery_send(
+    rule_id: int,
+    files: str | None = None,
+    recipient: str | None = None,
+    delivery_key: str | None = None,
+) -> dict[str, Any]:
+    """送达已写完的资料；同一接收人的同一文件只保留原送达记录。"""
+    if not store.find("anomaly_detect", rule_id):
+        raise HTTPException(404, f"检测规则 {rule_id} 不存在")
+    targets: list[str] | str | None = files
+    if files and "," in files:
+        targets = [item.strip() for item in files.split(",") if item.strip()]
+    return monitor_delivery_service.deliver(
+        rule_id, files=targets, recipient=recipient, delivery_key=delivery_key)
+
+
+@router.get("/monitor-delivery/{rule_id}/manifest")
+def monitor_delivery_manifest(rule_id: int, delivery_key: str | None = None) -> dict[str, Any]:
+    """读取交付文件清单、可领取状态和送达记录。"""
+    if not store.find("anomaly_detect", rule_id):
+        raise HTTPException(404, f"检测规则 {rule_id} 不存在")
+    return monitor_delivery_service.manifest(rule_id, delivery_key=delivery_key)
+
 
 
 # ---- 链路5：指标校准→数据服务→查询日志 ----
